@@ -8,6 +8,19 @@ import (
 	"regexp"
 	"strings"
 	"time"
+    
+    "golang.org/x/term"
+)
+
+// Константы telnet протокола
+const (
+    IAC  = 255 // Interpret As Command
+    DONT = 254
+    DO   = 253
+    WONT = 252
+    WILL = 251
+    SB   = 250 // Subnegotiation Begin
+    SE   = 240 // Subnegotiation End
 )
 
 // Структура для хранения пары логин/пароль
@@ -72,68 +85,78 @@ func loadCredentials() []Credential {
 
 // Попытка подключения с конкретными кредами
 func tryLogin(host string, cred Credential) (net.Conn, error) {
-	// Парсим хост
-	if !strings.Contains(host, ":") {
-		host = host + ":23"
-	}
-	
-	conn, err := net.DialTimeout("tcp", host, 5*time.Second)
-	if err != nil {
-		return nil, fmt.Errorf("ошибка подключения: %v", err)
-	}
-	
-	conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-	
-	// Читаем приветствие
-	buf := make([]byte, 4096)
-	n, _ := conn.Read(buf)
-	response := string(buf[:n])
-	
-	// Отправляем логин
-	if strings.Contains(strings.ToLower(response), "login") {
-		conn.Write([]byte(cred.Username + "\r\n"))
-		time.Sleep(200 * time.Millisecond)
-		
-		// Читаем запрос пароля
-		conn.SetReadDeadline(time.Now().Add(3 * time.Second))
-		n, _ = conn.Read(buf)
-		response = string(buf[:n])
-		
-		// Отправляем пароль
-		if strings.Contains(strings.ToLower(response), "password") {
-			conn.Write([]byte(cred.Password + "\r\n"))
-			time.Sleep(300 * time.Millisecond)
-		}
-	}
-	
-	// Проверяем успешность входа
-	// Если после отправки пароля пришёл пригласительный знак ($, >, # и т.д.)
-	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
-	n, _ = conn.Read(buf)
-	response = string(buf[:n])
+    if !strings.Contains(host, ":") {
+        host = host + ":23"
+    }
 
-	// Если пришёл $ или > делаем enable admin
-	
+    conn, err := net.DialTimeout("tcp", host, 5*time.Second)
+    if err != nil {
+        return nil, fmt.Errorf("ошибка подключения: %v", err)
+    }
 
-	// Проверяем наличие признаков успешного входа
-	if strings.Contains(response, "$") || 
-	   strings.Contains(response, ">") || 
-	   strings.Contains(response, "#") ||
-	   strings.Contains(response, "Welcome") ||
-	   strings.Contains(response, "successful") {
-		return conn, nil
-	}
-	
-	// Если есть "Login incorrect" или "Authentication failed" - ошибка
-	if strings.Contains(strings.ToLower(response), "incorrect") ||
-	   strings.Contains(strings.ToLower(response), "failed") ||
-	   strings.Contains(strings.ToLower(response), "denied") {
-		conn.Close()
-		return nil, fmt.Errorf("неверный логин/пароль")
-	}
-	
-	// Если ничего не понятно - считаем что вход успешен
-	return conn, nil
+    // readUntil – читает данные, пока не встретится одна из подстрок (без учёта регистра)
+    readUntil := func(prompts []string, timeout time.Duration) (string, error) {
+        buf := make([]byte, 4096)
+        var acc []byte
+        deadline := time.Now().Add(timeout)
+        for time.Now().Before(deadline) {
+            conn.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+            n, err := conn.Read(buf)
+            if n > 0 {
+                // Фильтруем телнет-команды сразу
+                clean := filterTelnetCommands(buf[:n])
+                acc = append(acc, clean...)
+                text := string(acc)
+                for _, p := range prompts {
+                    if strings.Contains(strings.ToLower(text), strings.ToLower(p)) {
+                        return text, nil
+                    }
+                }
+            }
+            if err != nil {
+                if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+                    continue
+                }
+                return string(acc), err
+            }
+        }
+        return string(acc), fmt.Errorf("таймаут ожидания одного из: %v", prompts)
+    }
+
+    // Этап 1: ждём запрос логина
+    _, err = readUntil([]string{"login:", "username:", "user:"}, 8*time.Second)
+    if err != nil {
+        conn.Close()
+        return nil, fmt.Errorf("не получен запрос логина: %v", err)
+    }
+    // Отправляем логин
+    conn.Write([]byte(cred.Username + "\r\n"))
+
+    // Этап 2: ждём запрос пароля
+    _, err = readUntil([]string{"password:", "pass:"}, 8*time.Second)
+    if err != nil {
+        conn.Close()
+        return nil, fmt.Errorf("не получен запрос пароля: %v", err)
+    }
+    // Отправляем пароль
+    conn.Write([]byte(cred.Password + "\r\n"))
+
+    // Этап 3: ждём приглашение после входа (успех)
+    prompt, err := readUntil([]string{"$", ">", "#", "(config)>", "~$", "]"}, 8*time.Second)
+    if err != nil {
+        conn.Close()
+        return nil, fmt.Errorf("не получено приглашение после входа: %v", err)
+    }
+
+    // Дополнительная проверка на отказ
+    if strings.Contains(strings.ToLower(prompt), "incorrect") ||
+        strings.Contains(strings.ToLower(prompt), "failed") ||
+        strings.Contains(strings.ToLower(prompt), "denied") {
+        conn.Close()
+        return nil, fmt.Errorf("неверный логин/пароль")
+    }
+
+    return conn, nil
 }
 
 // Основная функция подключения с перебором кредов
@@ -149,20 +172,99 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 			fmt.Println("✅ Успешно!")
 			fmt.Printf("\n--- Сессия открыта под %s ---\n", cred.Username)
 			fmt.Println("Вводите команды (Ctrl+C для выхода)")
-			
-			// Интерактивный режим
+			conn.Write([]byte("\r\n"))
+
+			// Настройка терминала в raw mode для интерактивного ввода
+			oldState, err := term.MakeRaw(int(os.Stdin.Fd()))
+			if err != nil {
+				return fmt.Errorf("не удалось перевести терминал в raw mode: %w", err)
+			}
+			defer term.Restore(int(os.Stdin.Fd()), oldState)
+
+			// Создаем канал для синхронизации
+			done := make(chan struct{})
+			defer close(done)
+
+			// Чтение из telnet соединения и вывод на экран
 			go func() {
-				scanner := bufio.NewScanner(conn)
-				for scanner.Scan() {
-					fmt.Println(scanner.Text())
+				defer func() {
+					done <- struct{}{}
+				}()
+
+				reader := bufio.NewReader(conn)
+				writer := bufio.NewWriter(os.Stdout)
+				
+				buf := make([]byte, 4096)
+				
+				for {
+					select {
+					case <-done:
+						return
+					default:
+						// Устанавливаем таймаут для неблокирующего чтения
+						conn.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+						
+						n, err := reader.Read(buf)
+						if n > 0 {
+							// Обработка телнет команд (IAC - Interpret As Command)
+							data := buf[:n]
+							// Фильтруем телнет escape-последовательности
+							cleanData := filterTelnetCommands(data)
+							
+							if len(cleanData) > 0 {
+								writer.Write(cleanData)
+								writer.Flush()
+							}
+						}
+						
+						if err != nil {
+							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
+								continue
+							}
+							return
+						}
+					}
 				}
 			}()
+
+			// Чтение пользовательского ввода и отправка в telnet
+			go func() {
+				defer func() {
+					done <- struct{}{}
+				}()
+
+				reader := bufio.NewReader(os.Stdin)
+				
+				for {
+					select {
+					case <-done:
+						return
+					default:
+						char, err := reader.ReadByte()
+						if err != nil {
+							return
+						}
+						
+						// Отправляем каждый символ в telnet соединение
+						conn.Write([]byte{char})
+						
+						// Обработка специальных клавиш
+						switch char {
+						case 3: // Ctrl+C
+							return
+						case 13: // Enter
+							conn.Write([]byte{'\n'})
+						}
+					}
+				}
+			}()
+
+			// Ожидаем завершения работы
+			<-done
 			
-			stdinScanner := bufio.NewScanner(os.Stdin)
-			for stdinScanner.Scan() {
-				cmd := stdinScanner.Text()
-				conn.Write([]byte(cmd + "\r\n"))
-			}
+			// Восстанавливаем терминал
+			term.Restore(int(os.Stdin.Fd()), oldState)
+			fmt.Println("\nСессия завершена")
 			return nil
 		}
 		
@@ -172,6 +274,45 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 	
 	return fmt.Errorf("все попытки входа не удались. Последняя ошибка: %v", lastErr)
 }
+
+// Функция для фильтрации telnet команд
+func filterTelnetCommands(data []byte) []byte {
+	result := make([]byte, 0, len(data))
+	i := 0
+	
+	for i < len(data) {
+		if data[i] == IAC { // Interpret As Command (255)
+			// Пропускаем telnet команды
+			if i+1 < len(data) {
+				switch data[i+1] {
+				case WILL, WONT, DO, DONT:
+					// Пропускаем опции с параметром
+					i += 3
+				case SB:
+					// Пропускаем до конца subnegotiation
+					for i < len(data) {
+						if i+1 < len(data) && data[i] == IAC && data[i+1] == SE {
+							i += 2
+							break
+						}
+						i++
+					}
+				default:
+					// Пропускаем другие команды
+					i += 2
+				}
+			} else {
+				i++
+			}
+		} else {
+			result = append(result, data[i])
+			i++
+		}
+	}
+	
+	return result
+}
+
 
 // Парсинг telnet:// ссылок
 func parseTelnetURL(url string) string {
