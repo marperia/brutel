@@ -2,14 +2,18 @@ package main
 
 import (
 	"bufio"
+	"context"
 	"fmt"
 	"net"
 	"os"
+	"os/signal"
 	"regexp"
 	"strings"
+	"sync"
+	"syscall"
 	"time"
-    
-    "golang.org/x/term"
+
+	"golang.org/x/term"
 )
 
 // Константы telnet протокола
@@ -181,16 +185,18 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 			}
 			defer term.Restore(int(os.Stdin.Fd()), oldState)
 
-			// Создаем канал для синхронизации
-			done := make(chan struct{})
-			defer close(done)
+			// Контекст для отмены горутин
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			
+			// WaitGroup для ожидания завершения горутин
+			var wg sync.WaitGroup
 
 			// Чтение из telnet соединения и вывод на экран
+			wg.Add(1)
 			go func() {
-				defer func() {
-					done <- struct{}{}
-				}()
-
+				defer wg.Done()
+				
 				reader := bufio.NewReader(conn)
 				writer := bufio.NewWriter(os.Stdout)
 				
@@ -198,7 +204,7 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 				
 				for {
 					select {
-					case <-done:
+					case <-ctx.Done():
 						return
 					default:
 						// Устанавливаем таймаут для неблокирующего чтения
@@ -221,6 +227,8 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 							if netErr, ok := err.(net.Error); ok && netErr.Timeout() {
 								continue
 							}
+							// Ошибка чтения - завершаем
+							cancel()
 							return
 						}
 					}
@@ -228,29 +236,36 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 			}()
 
 			// Чтение пользовательского ввода и отправка в telnet
+			wg.Add(1)
 			go func() {
-				defer func() {
-					done <- struct{}{}
-				}()
-
+				defer wg.Done()
+				
 				reader := bufio.NewReader(os.Stdin)
 				
 				for {
 					select {
-					case <-done:
+					case <-ctx.Done():
 						return
 					default:
 						char, err := reader.ReadByte()
 						if err != nil {
+							cancel()
 							return
 						}
 						
-						// Отправляем каждый символ в telnet соединение
-						conn.Write([]byte{char})
+						// Проверяем, не закрыт ли контекст
+						select {
+						case <-ctx.Done():
+							return
+						default:
+							// Отправляем каждый символ в telnet соединение
+							conn.Write([]byte{char})
+						}
 						
 						// Обработка специальных клавиш
 						switch char {
 						case 3: // Ctrl+C
+							cancel()
 							return
 						case 13: // Enter
 							conn.Write([]byte{'\n'})
@@ -259,8 +274,8 @@ func telnetConnectWithRetry(host string, creds []Credential) error {
 				}
 			}()
 
-			// Ожидаем завершения работы
-			<-done
+			// Ожидаем завершения обеих горутин
+			wg.Wait()
 			
 			// Восстанавливаем терминал
 			term.Restore(int(os.Stdin.Fd()), oldState)
@@ -333,6 +348,15 @@ func main() {
 		os.Exit(1)
 	}
 	
+	// Обработка сигналов
+	sigChan := make(chan os.Signal, 1)
+    signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+    go func() {
+        <-sigChan
+        fmt.Println("\n👋 Программа завершена")
+        os.Exit(0)
+    }()
+	
 	// Загружаем креды
 	creds := loadCredentials()
 	if len(creds) == 0 {
@@ -354,6 +378,13 @@ func main() {
 	// Подключаемся с перебором
 	if err := telnetConnectWithRetry(host, creds); err != nil {
 		fmt.Println("\n❌", err)
+        fmt.Println("\nНажмите Enter для выхода...")
+        fmt.Scanln()
 		os.Exit(1)
 	}
+	
+	// ===== ПРОГРАММА НЕ ЗАВЕРШИТСЯ =====
+    // (если сессия завершилась, ждём Enter)
+    fmt.Println("\nНажмите Enter для выхода...")
+    fmt.Scanln()
 }

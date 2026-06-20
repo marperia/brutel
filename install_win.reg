@@ -1,0 +1,13 @@
+Windows Registry Editor Version 5.00
+
+[HKEY_CLASSES_ROOT\telnet]
+@="URL:Telnet Protocol"
+"URL Protocol"=""
+
+[HKEY_CLASSES_ROOT\telnet\shell]
+@="open"
+
+[HKEY_CLASSES_ROOT\telnet\shell\open]
+
+[HKEY_CLASSES_ROOT\telnet\shell\open\command]
+@="\"C:\\path\\to\\brutel.exe\" \"%1\""

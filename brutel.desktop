@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=Brutel Telnet Handler
+Exec=/path/to/the/brutel/handler.sh %U
+Terminal=true
+Type=Application
+MimeType=x-scheme-handler/telnet;
+Path=/path/to/the/folder/brutel

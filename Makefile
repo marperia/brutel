@@ -1,5 +1,5 @@
 APP_NAME = brutel
-VERSION = 1.0.0
+VERSION = 1.0.1
 
 # Windows
 build-win:
